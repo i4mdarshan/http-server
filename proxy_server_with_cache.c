@@ -115,6 +115,29 @@ int main(int argc, char* argv[]){
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port_number); // Convert port_number to Network byte order
     server_addr.sin_addr.s_addr = INADDR_ANY; // Assign the server address randomly
+
+    log_to_cli("Binding socket to port: " + port_number);
+    // Bind the socket port
+    int bindSocket_result = bind(proxy_socketId, (struct sockaddr*)&server_addr, sizeof(server_addr));
+    if (bindSocket_result < 0)
+    {
+        log_to_cli("Port is not available, failed to bind the socket");
+        perror("Reason: ");
+        exit(1);
+    }
+    
+    log_to_cli("Socket binded successfully");
+
+    // Listen to the assigned port
+    int listen_status = listen(proxy_socketId, MAX_CLIENTS);
+    if(listen_status < 0){
+        log_to_cli("Failed to liste to port " + port_number);
+        perror("Reason: ");
+        exit(1);
+    }
+    log_to_cli("Listening to port " + port_number);
+
+    // Iterate through the clients which are connected to server
     
 
     return 0;
