@@ -20,7 +20,10 @@
 #include <semaphore.h>
 
 typedef struct cache_element cache_element;
-#define MAX_CLIENTS 10
+#define MAX_BYTES 4096                  // max allowed size of request/response
+#define MAX_CLIENTS 400                 // max number of client requests served at a time
+#define MAX_SIZE 200 * (1 << 20)        // size of the cache
+#define MAX_ELEMENT_SIZE 10 * (1 << 20) // max size of an element in cache
 
 struct cache_element
 {
@@ -45,7 +48,9 @@ pthread_mutex_t lock;
 
 cache_element *head;
 int cache_size;
-
+/**
+ * Function to log formatted messages to cli
+ */
 void log_to_cli(const char *message)
 {
     // Get the current time
@@ -60,6 +65,257 @@ void log_to_cli(const char *message)
 
     // Print the log message with the date and time in square brackets
     printf("[%s] %s\n", time_buffer, message);
+}
+
+/**
+ * Function to send error response with repective HTTP codes
+ */
+
+int sendErrorMessage(int socket, int status_code)
+{
+    char str[1024];
+    char currentTime[50];
+    time_t now = time(0);
+
+    struct tm data = *gmtime(&now);
+    strftime(currentTime, sizeof(currentTime), "%a, %d %b %Y %H:%M:%S %Z", &data);
+
+    switch (status_code)
+    {
+    case 400:
+        snprintf(str, sizeof(str), "HTTP/1.1 400 Bad Request\r\nContent-Length: 95\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>400 Bad Request</TITLE></HEAD>\n<BODY><H1>400 Bad Rqeuest</H1>\n</BODY></HTML>", currentTime);
+        log_to_cli("400 Bad Request\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    case 403:
+        snprintf(str, sizeof(str), "HTTP/1.1 403 Forbidden\r\nContent-Length: 112\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>403 Forbidden</TITLE></HEAD>\n<BODY><H1>403 Forbidden</H1><br>Permission Denied\n</BODY></HTML>", currentTime);
+        log_to_cli("403 Forbidden\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    case 404:
+        snprintf(str, sizeof(str), "HTTP/1.1 404 Not Found\r\nContent-Length: 91\r\nContent-Type: text/html\r\nConnection: keep-alive\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>\n<BODY><H1>404 Not Found</H1>\n</BODY></HTML>", currentTime);
+        log_to_cli("404 Not Found\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    case 500:
+        snprintf(str, sizeof(str), "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 115\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>500 Internal Server Error</TITLE></HEAD>\n<BODY><H1>500 Internal Server Error</H1>\n</BODY></HTML>", currentTime);
+        // printf("500 Internal Server Error\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    case 501:
+        snprintf(str, sizeof(str), "HTTP/1.1 501 Not Implemented\r\nContent-Length: 103\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>404 Not Implemented</TITLE></HEAD>\n<BODY><H1>501 Not Implemented</H1>\n</BODY></HTML>", currentTime);
+        log_to_cli("501 Not Implemented\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    case 505:
+        snprintf(str, sizeof(str), "HTTP/1.1 505 HTTP Version Not Supported\r\nContent-Length: 125\r\nConnection: keep-alive\r\nContent-Type: text/html\r\nDate: %s\r\nServer: VaibhavN/14785\r\n\r\n<HTML><HEAD><TITLE>505 HTTP Version Not Supported</TITLE></HEAD>\n<BODY><H1>505 HTTP Version Not Supported</H1>\n</BODY></HTML>", currentTime);
+        log_to_cli("505 HTTP Version Not Supported\n");
+        send(socket, str, strlen(str), 0);
+        break;
+
+    default:
+        return -1;
+    }
+    return 1;
+}
+
+/**
+ * Function to make a remote connection to server
+ */
+int connectRemoteServer(char *host_addr, int port_num)
+{
+    // Creating Socket for remote server ---------------------------
+
+    int remoteSocket = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (remoteSocket < 0)
+    {
+        log_to_cli("Error in Creating Socket.\n");
+        return -1;
+    }
+
+    // Get host by the name or ip address provided
+
+    struct hostent *host = gethostbyname(host_addr);
+    if (host == NULL)
+    {
+        fprintf(stderr, "No such host exists.\n");
+        return -1;
+    }
+
+    // inserts ip address and port number of host in struct `server_addr`
+    struct sockaddr_in server_addr;
+
+    bzero((char *)&server_addr, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port_num);
+
+    bcopy((char *)host->h_addr, (char *)&server_addr.sin_addr.s_addr, host->h_length);
+
+    // Connect to Remote server ----------------------------------------------------
+
+    if (connect(remoteSocket, (struct sockaddr *)&server_addr, (socklen_t)sizeof(server_addr)) < 0)
+    {
+        fprintf(stderr, "Error in connecting !\n");
+        return -1;
+    }
+    // free(host_addr);
+    return remoteSocket;
+}
+
+/**
+ * Function to check the HTTP version of the remote server
+ */
+int checkHTTPversion(char *msg)
+{
+    int version = -1;
+
+    if (strncmp(msg, "HTTP/1.1", 8) == 0)
+    {
+        version = 1;
+    }
+    else if (strncmp(msg, "HTTP/1.0", 8) == 0)
+    {
+        version = 1; // Handling this similar to version 1.1
+    }
+    else
+        version = -1;
+
+    return version;
+}
+
+/**
+ * Thread function to initiate and manage new thread for each request
+ *
+ */
+void *thread_fn(void *socketNew)
+{
+    sem_wait(&seamaphore);
+    int p;
+    sem_getvalue(&seamaphore, &p);
+    printf("semaphore value:%d\n", p);
+    int *t = (int *)(socketNew);
+    int socket = *t;            // Socket is socket descriptor of the connected Client
+    int bytes_send_client, len; // Bytes Transferred
+
+    char *buffer = (char *)calloc(MAX_BYTES, sizeof(char)); // Creating buffer of 4kb for a client
+
+    bzero(buffer, MAX_BYTES);                               // Making buffer zero
+    bytes_send_client = recv(socket, buffer, MAX_BYTES, 0); // Receiving the Request of client by proxy server
+
+    while (bytes_send_client > 0)
+    {
+        len = strlen(buffer);
+        // loop until u find "\r\n\r\n" in the buffer
+        if (strstr(buffer, "\r\n\r\n") == NULL)
+        {
+            bytes_send_client = recv(socket, buffer + len, MAX_BYTES - len, 0);
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // printf("--------------------------------------------\n");
+    // printf("%s\n",buffer);
+    // printf("----------------------%d----------------------\n",strlen(buffer));
+
+    char *tempReq = (char *)malloc(strlen(buffer) * sizeof(char) + 1);
+    // tempReq, buffer both store the http request sent by client
+    for (int i = 0; i < strlen(buffer); i++)
+    {
+        tempReq[i] = buffer[i];
+    }
+
+    // checking for the request in cache
+    struct cache_element *temp = NULL;
+
+    if (temp != NULL)
+    {
+        // request found in cache, so sending the response to client from proxy's cache
+        int size = temp->len / sizeof(char);
+        int pos = 0;
+        char response[MAX_BYTES];
+        while (pos < size)
+        {
+            bzero(response, MAX_BYTES);
+            for (int i = 0; i < MAX_BYTES; i++)
+            {
+                response[i] = temp->data[pos];
+                pos++;
+            }
+            send(socket, response, MAX_BYTES, 0);
+        }
+        log_to_cli("Data retrived from the Cache\n\n");
+        printf("%s\n\n", response);
+        // close(socketNew);
+        // sem_post(&seamaphore);
+        // return NULL;
+    }
+
+    else if (bytes_send_client > 0)
+    {
+        len = strlen(buffer);
+        // Parsing the request
+        ParsedRequest *request = ParsedRequest_create();
+
+        // ParsedRequest_parse returns 0 on success and -1 on failure.On success it stores parsed request in
+        //  the request
+        if (ParsedRequest_parse(request, buffer, len) < 0)
+        {
+            log_to_cli("Parsing failed\n");
+        }
+        else
+        {
+            bzero(buffer, MAX_BYTES);
+            if (!strcmp(request->method, "GET"))
+            {
+
+                if (request->host && request->path && (checkHTTPversion(request->version) == 1))
+                {
+                    bytes_send_client = handle_request(socket, request, tempReq); // Handle GET request
+                    if (bytes_send_client == -1)
+                    {
+                        sendErrorMessage(socket, 500);
+                    }
+                }
+                else
+                    sendErrorMessage(socket, 500); // 500 Internal Error
+            }
+            else
+            {
+                log_to_cli("This code doesn't support any method other than GET\n");
+            }
+        }
+        // freeing up the request pointer
+        ParsedRequest_destroy(request);
+    }
+
+    else if (bytes_send_client < 0)
+    {
+        log_to_cli("Error in receiving from client.\n");
+        perror("Reason: \n");
+    }
+    else if (bytes_send_client == 0)
+    {
+        log_to_cli("Client disconnected!\n");
+    }
+
+    shutdown(socket, SHUT_RDWR);
+    close(socket);
+    free(buffer);
+    sem_post(&seamaphore);
+
+    sem_getvalue(&seamaphore, &p);
+    printf("Semaphore post value:%d\n", p);
+    free(tempReq);
+    return NULL;
 }
 
 int main(int argc, char *argv[])
